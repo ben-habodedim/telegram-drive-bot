@@ -3,6 +3,7 @@ telethon>=1.34.0,<2.0.0
 
 # Google Service Account authentication
 google-auth>=2.29.0,<3.0.0
+requests>=2.31.0,<3.0.0
 
 # Async HTTP client (Drive resumable upload + health-check server)
 aiohttp>=3.9.0,<4.0.0
