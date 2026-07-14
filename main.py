@@ -27,7 +27,7 @@ from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeFilename
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as GoogleCredentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  LOGGING
@@ -44,7 +44,10 @@ API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 SESSION_STR = os.environ["TELEGRAM_STRING_SESSION"]
 PARENT_FOLDER_ID = os.environ["GOOGLE_PARENT_FOLDER_ID"]
-SA_INFO = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
+# Google User OAuth2 configuration
+GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
+GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
+GOOGLE_REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
 CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB – must be a multiple of 256 KiB
 DRIVE_API = "https://www.googleapis.com"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -86,17 +89,22 @@ def classify_file(filename: str | None, mime_type: str | None) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  GOOGLE AUTH
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_creds: service_account.Credentials | None = None
+_creds: GoogleCredentials | None = None
 def _auth_headers() -> dict[str, str]:
     """Return Authorization headers, refreshing the token if needed."""
     global _creds
     if _creds is None:
-        _creds = service_account.Credentials.from_service_account_info(
-            SA_INFO, scopes=SCOPES
+        _creds = GoogleCredentials(
+            token=None,
+            refresh_token=GOOGLE_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=SCOPES
         )
-        logger.info("🔑 Service Account: %s", _creds.service_account_email)
+        logger.info("🔑 OAuth2 Credentials initialized")
     if not _creds.valid:
-        logger.info("🔄 Refreshing Google auth token...")
+        logger.info("🔄 Refreshing Google OAuth2 token...")
         _creds.refresh(GoogleAuthRequest())
         logger.info("✅ Token refreshed, valid until %s", _creds.expiry)
     return {"Authorization": f"Bearer {_creds.token}"}
@@ -347,9 +355,13 @@ async def on_new_file(event):
         logger.info("[Step 1/3] ✅ Target folder: %s → %s", folder_name, target_folder_id)
         # Step 2: Notify user
         logger.info("[Step 2/3] Sending status message to Telegram...")
-        status_msg = await event.reply(
-            f"📤 מעלה את **{filename}** לתיקייה **{folder_name}**…"
-        )
+        status_msg = None
+        try:
+            status_msg = await event.reply(
+                f"📤 מעלה את **{filename}** לתיקייה **{folder_name}**…"
+            )
+        except Exception as tg_err:
+            logger.warning("⚠️ Could not send status reply message: %s", tg_err)
         # Step 3: Stream from Telegram → Google Drive
         logger.info("[Step 3/3] Starting stream: Telegram → Google Drive...")
         result = await stream_to_drive(
@@ -358,21 +370,35 @@ async def on_new_file(event):
         if result:
             file_id = result.get("id", "?")
             logger.info("✅ Upload complete: %s → Drive ID %s", filename, file_id)
-            await status_msg.edit(
-                f"✅ **{filename}** הועלה בהצלחה לתיקייה **{folder_name}**"
-            )
+            if status_msg:
+                try:
+                    await status_msg.edit(
+                        f"✅ **{filename}** הועלה בהצלחה לתיקייה **{folder_name}**"
+                    )
+                except Exception as tg_err:
+                    logger.warning("⚠️ Could not edit status message: %s", tg_err)
         else:
             logger.warning("⚠️ Upload finished without confirmation: %s", filename)
-            await status_msg.edit(
-                f"⚠️ העלאה של **{filename}** הסתיימה ללא אישור מגוגל"
-            )
+            if status_msg:
+                try:
+                    await status_msg.edit(
+                        f"⚠️ העלאה של **{filename}** הסתיימה ללא אישור מגוגל"
+                    )
+                except Exception as tg_err:
+                    logger.warning("⚠️ Could not edit status message: %s", tg_err)
     except Exception as exc:
         logger.exception("❌ Upload FAILED for '%s'. Error type: %s, Details: %s",
                          filename, type(exc).__name__, exc)
-        try:
-            await event.reply(f"❌ שגיאה בהעלאת **{filename}**: `{exc}`")
-        except Exception:
-            pass  # If replying also fails, just log it
+        if status_msg:
+            try:
+                await status_msg.edit(f"❌ שגיאה בהעלאת **{filename}**: `{exc}`")
+            except Exception:
+                pass
+        else:
+            try:
+                await event.reply(f"❌ שגיאה בהעלאת **{filename}**: `{exc}`")
+            except Exception:
+                pass  # If replying also fails, just log it
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  HEALTH-CHECK HTTP SERVER (keeps Render web-service alive)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -397,8 +423,7 @@ async def main():
     logger.info("🚀 TELEGRAM DRIVE BOT STARTING")
     logger.info("="*60)
     logger.info("Config: API_ID=%s, PARENT_FOLDER=%s", API_ID, PARENT_FOLDER_ID)
-    logger.info("Config: SA project=%s", SA_INFO.get("project_id", "?"))
-    logger.info("Config: SA email=%s", SA_INFO.get("client_email", "?"))
+    logger.info("Config: OAuth client_id=%s...", GOOGLE_CLIENT_ID[:15] if GOOGLE_CLIENT_ID else "None")
     logger.info("Config: CHUNK_SIZE=%s MB", CHUNK_SIZE // (1024*1024))
     # 1) Start health-check server (Render requires a listening port)
     await start_health_server()
