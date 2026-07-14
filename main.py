@@ -563,6 +563,10 @@ def extract_file_info(message) -> tuple[str | None, str | None, int | None]:
 @client.on(events.NewMessage(incoming=True))
 async def on_new_file(event):
     """Handle incoming messages – authenticate users and process files."""
+    # Only process messages from private/direct chats
+    if not event.is_private:
+        return
+
     message = event.message
     sender = await event.get_sender()
     if not sender:
