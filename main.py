@@ -168,24 +168,35 @@ async def save_auth_data_to_drive():
     try:
         metadata = {
             "name": "authorized_users.json",
-            "parents": [_system_folder_id],
-            "mimeType": "application/json"
+            "parents": [_system_folder_id]
         }
         
+        boundary = "system_config_boundary"
+        headers_multipart = {
+            **headers,
+            "Content-Type": f"multipart/related; boundary={boundary}"
+        }
+        
+        # Construct RFC 2387 multipart body manually for Google Drive API
+        multipart_body = (
+            f"--{boundary}\r\n"
+            f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{json.dumps(metadata)}\r\n"
+            f"--{boundary}\r\n"
+            f"Content-Type: application/json\r\n\r\n"
+            f"{json.dumps(payload, indent=2)}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode('utf-8')
+
         async with aiohttp.ClientSession() as session:
-            # Multi-part upload or resumable is overkill for a tiny json metadata + body upload. 
-            # We can use simple multi-part post to create file with content.
-            # Google Drive simple media upload with query parameters is simplest:
             async with session.post(
                 f"{DRIVE_API}/upload/drive/v3/files?uploadType=multipart",
-                headers={**headers},
-                data=aiohttp.MultipartWriter('related').append_json(metadata).writer.append(
-                    json_bytes, headers={"Content-Type": "application/json"}
-                )
+                headers=headers_multipart,
+                data=multipart_body
             ) as resp:
                 if resp.status >= 400:
                     err = await resp.text()
-                    logger.error("❌ Create config failed: %s", err)
+                    logger.error("❌ Create config failed (%d): %s", resp.status, err)
                     return
                 res_data = await resp.json()
                 _auth_file_drive_id = res_data.get("id")
