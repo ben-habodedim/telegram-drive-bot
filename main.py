@@ -3,14 +3,11 @@ Telegram Userbot → Google Drive Streaming Uploader
 ===================================================
 Streams files from Telegram directly to Google Drive without ever
 writing to disk or loading an entire file into RAM.
-
 Designed for Render.com free tier (512 MB RAM hard limit).
-
 Architecture
 ------------
   Telegram ──iter_download(5 MB chunks)──▶ bytearray buffer
   buffer   ──resumable PUT──────────────▶ Google Drive API
-
 Environment Variables
 ---------------------
   TELEGRAM_API_ID          – Telegram API ID (integer)
@@ -20,13 +17,11 @@ Environment Variables
   GOOGLE_CREDENTIALS_JSON  – Full JSON content of SA key file
   PORT                     – (optional) HTTP port for health checks
 """
-
 import os
 import json
 import asyncio
 import logging
 import mimetypes
-
 import aiohttp
 from aiohttp import web
 from telethon import TelegramClient, events
@@ -34,46 +29,35 @@ from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeFilename
 from google.oauth2 import service_account
 from google.auth.transport.requests import Request as GoogleAuthRequest
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  LOGGING
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(levelname)-7s │ %(message)s",
 )
 logger = logging.getLogger("drive-bot")
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CONFIGURATION (from environment variables)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
 SESSION_STR = os.environ["TELEGRAM_STRING_SESSION"]
 PARENT_FOLDER_ID = os.environ["GOOGLE_PARENT_FOLDER_ID"]
 SA_INFO = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
-
 CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB – must be a multiple of 256 KiB
 DRIVE_API = "https://www.googleapis.com"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 MAX_RETRIES = 3
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  FILE CLASSIFICATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 _VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"}
 _AUDIO_EXT = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a", ".opus"}
 _DOC_EXT = {
     ".pdf", ".docx", ".doc", ".txt", ".xlsx", ".xls",
     ".pptx", ".ppt", ".csv", ".rtf", ".odt", ".ods", ".epub",
 }
-
 # Maps category key → Hebrew subfolder name
 CATEGORY_FOLDERS = {
     "video": "וידאו",
@@ -81,8 +65,6 @@ CATEGORY_FOLDERS = {
     "documents": "מסמכים",
     "other": "אחר",
 }
-
-
 def classify_file(filename: str | None, mime_type: str | None) -> str:
     """Return a category key based on MIME type or file extension."""
     # 1) Check MIME type first
@@ -91,7 +73,6 @@ def classify_file(filename: str | None, mime_type: str | None) -> str:
             return "video"
         if mime_type.startswith("audio/"):
             return "audio"
-
     # 2) Fall back to extension
     if filename:
         ext = os.path.splitext(filename)[1].lower()
@@ -101,17 +82,11 @@ def classify_file(filename: str | None, mime_type: str | None) -> str:
             return "audio"
         if ext in _DOC_EXT:
             return "documents"
-
     return "other"
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  GOOGLE AUTH
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 _creds: service_account.Credentials | None = None
-
-
 def _auth_headers() -> dict[str, str]:
     """Return Authorization headers, refreshing the token if needed."""
     global _creds
@@ -119,18 +94,16 @@ def _auth_headers() -> dict[str, str]:
         _creds = service_account.Credentials.from_service_account_info(
             SA_INFO, scopes=SCOPES
         )
+        logger.info("🔑 Service Account: %s", _creds.service_account_email)
     if not _creds.valid:
+        logger.info("🔄 Refreshing Google auth token...")
         _creds.refresh(GoogleAuthRequest())
+        logger.info("✅ Token refreshed, valid until %s", _creds.expiry)
     return {"Authorization": f"Bearer {_creds.token}"}
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  GOOGLE DRIVE HELPERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 _folder_cache: dict[str, str] = {}
-
-
 async def ensure_subfolder(
     session: aiohttp.ClientSession,
     folder_name: str,
@@ -139,26 +112,29 @@ async def ensure_subfolder(
     """Find a subfolder by name inside *parent_id*, creating it if absent."""
     if folder_name in _folder_cache:
         return _folder_cache[folder_name]
-
     headers = _auth_headers()
-
     # Search for existing folder
     query = (
         f"name='{folder_name}' and '{parent_id}' in parents "
         f"and mimeType='application/vnd.google-apps.folder' and trashed=false"
     )
+    logger.info("🔍 Searching for folder '%s' in parent '%s'...", folder_name, parent_id)
     async with session.get(
         f"{DRIVE_API}/drive/v3/files",
         headers=headers,
         params={"q": query, "fields": "files(id)", "pageSize": "1"},
     ) as resp:
+        if resp.status >= 400:
+            error_body = await resp.text()
+            logger.error("❌ Folder search failed (%d): %s", resp.status, error_body)
+            raise RuntimeError(f"Folder search failed ({resp.status}): {error_body}")
         data = await resp.json()
         if data.get("files"):
             _folder_cache[folder_name] = data["files"][0]["id"]
-            logger.info("Found folder '%s' → %s", folder_name, _folder_cache[folder_name])
+            logger.info("✅ Found folder '%s' → %s", folder_name, _folder_cache[folder_name])
             return _folder_cache[folder_name]
-
     # Create the folder
+    logger.info("📁 Folder '%s' not found, creating...", folder_name)
     metadata = {
         "name": folder_name,
         "mimeType": "application/vnd.google-apps.folder",
@@ -169,13 +145,14 @@ async def ensure_subfolder(
         headers={**headers, "Content-Type": "application/json"},
         json=metadata,
     ) as resp:
-        resp.raise_for_status()
+        if resp.status >= 400:
+            error_body = await resp.text()
+            logger.error("❌ Folder creation failed (%d): %s", resp.status, error_body)
+            raise RuntimeError(f"Folder creation failed ({resp.status}): {error_body}")
         folder_id = (await resp.json())["id"]
         _folder_cache[folder_name] = folder_id
-        logger.info("Created folder '%s' → %s", folder_name, folder_id)
+        logger.info("✅ Created folder '%s' → %s", folder_name, folder_id)
         return folder_id
-
-
 async def _init_resumable_upload(
     session: aiohttp.ClientSession,
     filename: str,
@@ -188,16 +165,20 @@ async def _init_resumable_upload(
     headers["Content-Type"] = "application/json; charset=UTF-8"
     headers["X-Upload-Content-Type"] = mime_type
     headers["X-Upload-Content-Length"] = str(total_size)
-
     async with session.post(
         f"{DRIVE_API}/upload/drive/v3/files?uploadType=resumable",
         headers=headers,
         json={"name": filename, "parents": [folder_id]},
     ) as resp:
-        resp.raise_for_status()
+        if resp.status >= 400:
+            error_body = await resp.text()
+            logger.error(
+                "❌ Resumable upload init failed (%d): %s", resp.status, error_body
+            )
+            raise RuntimeError(
+                f"Drive upload init failed ({resp.status}): {error_body}"
+            )
         return resp.headers["Location"]
-
-
 async def _upload_chunk(
     session: aiohttp.ClientSession,
     upload_url: str,
@@ -207,7 +188,6 @@ async def _upload_chunk(
 ) -> dict | None:
     """
     PUT a single chunk to the resumable upload URL.
-
     Returns the file metadata dict on the final chunk (HTTP 200/201),
     or None on an intermediate chunk (HTTP 308 Resume Incomplete).
     """
@@ -222,9 +202,11 @@ async def _upload_chunk(
         if resp.status == 308:
             return None
         body = await resp.text()
-        raise RuntimeError(f"Drive upload failed ({resp.status}): {body}")
-
-
+        logger.error(
+            "❌ Chunk upload failed (%d) at offset %d: %s",
+            resp.status, offset, body,
+        )
+        raise RuntimeError(f"Drive chunk upload failed ({resp.status}): {body}")
 async def _upload_chunk_with_retry(
     session: aiohttp.ClientSession,
     upload_url: str,
@@ -246,17 +228,12 @@ async def _upload_chunk_with_retry(
             )
             await asyncio.sleep(wait)
     return None  # unreachable, but keeps type checkers happy
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  STREAMING PIPELINE: Telegram → Google Drive
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 # Limit concurrent uploads to keep memory predictable.
 # 2 uploads × 5 MB buffer each = ~10 MB worst case
 _upload_sem = asyncio.Semaphore(2)
-
-
 async def stream_to_drive(
     tg_client: TelegramClient,
     message,
@@ -267,25 +244,25 @@ async def stream_to_drive(
 ) -> dict | None:
     """
     Stream a file from Telegram to Google Drive chunk-by-chunk.
-
     At any given moment, at most one CHUNK_SIZE buffer is held in RAM
     per upload, keeping total memory usage well under 512 MB.
     """
     async with _upload_sem:
         async with aiohttp.ClientSession() as http:
+            logger.info(
+                "⬆  Starting resumable upload: file='%s', mime='%s', size=%s, folder='%s'",
+                filename, mime_type, f"{file_size:,}", folder_id,
+            )
             upload_url = await _init_resumable_upload(
                 http, filename, mime_type, folder_id, file_size,
             )
-            logger.info("⬆  Resumable upload started: %s (%s bytes)", filename, f"{file_size:,}")
-
+            logger.info("✅ Resumable upload URL obtained for '%s'", filename)
             buf = bytearray()
             offset = 0
-
             async for chunk in tg_client.iter_download(
                 message.media, chunk_size=CHUNK_SIZE
             ):
                 buf.extend(chunk)
-
                 # Flush full chunks to Drive
                 while len(buf) >= CHUNK_SIZE:
                     piece = bytes(buf[:CHUNK_SIZE])
@@ -299,7 +276,6 @@ async def stream_to_drive(
                                 filename, pct, f"{offset:,}", f"{file_size:,}")
                     if result:
                         return result
-
             # Flush remaining bytes (last chunk, may be < CHUNK_SIZE)
             if buf:
                 result = await _upload_chunk_with_retry(
@@ -309,17 +285,11 @@ async def stream_to_drive(
                 logger.info("   %s – 100%% (%s / %s bytes) [final]",
                             filename, f"{offset:,}", f"{file_size:,}")
                 return result
-
     return None
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  TELEGRAM CLIENT & EVENT HANDLER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
-
-
 def extract_file_info(message) -> tuple[str | None, str | None, int | None]:
     """
     Extract (filename, mime_type, file_size) from a Telegram message.
@@ -330,7 +300,6 @@ def extract_file_info(message) -> tuple[str | None, str | None, int | None]:
         doc = message.document
         mime = doc.mime_type or "application/octet-stream"
         size = doc.size
-
         # Try to find the original filename
         name = None
         for attr in doc.attributes:
@@ -340,9 +309,7 @@ def extract_file_info(message) -> tuple[str | None, str | None, int | None]:
         if not name:
             ext = mimetypes.guess_extension(mime) or ""
             name = f"file_{doc.id}{ext}"
-
         return name, mime, size
-
     # ── Photos ──
     if message.photo:
         photo = message.photo
@@ -354,46 +321,40 @@ def extract_file_info(message) -> tuple[str | None, str | None, int | None]:
                 size = s_size
         name = f"photo_{photo.id}.jpg"
         return name, "image/jpeg", size if size > 0 else None
-
     return None, None, None
-
-
 @client.on(events.NewMessage(incoming=True))
 async def on_new_file(event):
     """Handle every incoming message – upload its media to Drive."""
     message = event.message
     if not message.media:
         return
-
     filename, mime_type, file_size = extract_file_info(message)
     if not filename or not file_size:
         return  # skip non-file media (contacts, polls, etc.)
-
     category = classify_file(filename, mime_type)
     folder_name = CATEGORY_FOLDERS[category]
-
     logger.info(
         "📥 Received: %s (%s bytes) → category '%s'",
         filename, f"{file_size:,}", category,
     )
-
     try:
-        # Resolve target subfolder (uses cache after first call)
+        # Step 1: Resolve target subfolder
+        logger.info("[Step 1/3] Resolving subfolder '%s'...", folder_name)
         async with aiohttp.ClientSession() as http:
             target_folder_id = await ensure_subfolder(
                 http, folder_name, PARENT_FOLDER_ID,
             )
-
-        # Notify the user that the upload is starting
+        logger.info("[Step 1/3] ✅ Target folder: %s → %s", folder_name, target_folder_id)
+        # Step 2: Notify user
+        logger.info("[Step 2/3] Sending status message to Telegram...")
         status_msg = await event.reply(
             f"📤 מעלה את **{filename}** לתיקייה **{folder_name}**…"
         )
-
-        # Stream from Telegram → Google Drive
+        # Step 3: Stream from Telegram → Google Drive
+        logger.info("[Step 3/3] Starting stream: Telegram → Google Drive...")
         result = await stream_to_drive(
             client, message, filename, mime_type, file_size, target_folder_id,
         )
-
         if result:
             file_id = result.get("id", "?")
             logger.info("✅ Upload complete: %s → Drive ID %s", filename, file_id)
@@ -405,23 +366,18 @@ async def on_new_file(event):
             await status_msg.edit(
                 f"⚠️ העלאה של **{filename}** הסתיימה ללא אישור מגוגל"
             )
-
     except Exception as exc:
-        logger.exception("❌ Upload failed for %s", filename)
+        logger.exception("❌ Upload FAILED for '%s'. Error type: %s, Details: %s",
+                         filename, type(exc).__name__, exc)
         try:
             await event.reply(f"❌ שגיאה בהעלאת **{filename}**: `{exc}`")
         except Exception:
             pass  # If replying also fails, just log it
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  HEALTH-CHECK HTTP SERVER (keeps Render web-service alive)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 async def _health_handler(_request):
     return web.Response(text="OK")
-
-
 async def start_health_server():
     """Start a minimal HTTP server for Render health checks."""
     app = web.Application()
@@ -432,31 +388,36 @@ async def start_health_server():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
     logger.info("🌐 Health-check server listening on port %d", port)
-
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  ENTRYPOINT
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 async def main():
+    # 0) Log startup config (redacted)
+    logger.info("="*60)
+    logger.info("🚀 TELEGRAM DRIVE BOT STARTING")
+    logger.info("="*60)
+    logger.info("Config: API_ID=%s, PARENT_FOLDER=%s", API_ID, PARENT_FOLDER_ID)
+    logger.info("Config: SA project=%s", SA_INFO.get("project_id", "?"))
+    logger.info("Config: SA email=%s", SA_INFO.get("client_email", "?"))
+    logger.info("Config: CHUNK_SIZE=%s MB", CHUNK_SIZE // (1024*1024))
     # 1) Start health-check server (Render requires a listening port)
     await start_health_server()
-
     # 2) Connect to Telegram
+    logger.info("📡 Connecting to Telegram...")
     await client.start()
     me = await client.get_me()
     logger.info("🤖 Logged in as %s (ID: %d)", me.first_name, me.id)
-
     # 3) Pre-warm the subfolder cache so the first upload is fast
+    logger.info("📂 Pre-warming subfolder cache...")
     async with aiohttp.ClientSession() as http:
         for _cat, folder_name in CATEGORY_FOLDERS.items():
-            await ensure_subfolder(http, folder_name, PARENT_FOLDER_ID)
+            try:
+                await ensure_subfolder(http, folder_name, PARENT_FOLDER_ID)
+            except Exception as exc:
+                logger.error("❌ Failed to ensure folder '%s': %s", folder_name, exc)
     logger.info("📂 Subfolder cache: %s", _folder_cache)
-
     # 4) Run forever, listening for incoming files
     logger.info("👂 Listening for incoming files…")
     await client.run_until_disconnected()
-
-
 if __name__ == "__main__":
     asyncio.run(main())
